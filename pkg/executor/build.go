@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -603,11 +604,88 @@ func CalculateDependencies(stages []config.KanikoStage, opts *config.KanikoOptio
 	return depGraph, nil
 }
 
+func hasGitFolder(path string) bool {
+	gitPath := filepath.Join(path, ".git")
+	absPath, err := filepath.Abs(gitPath)
+	if err != nil {
+		return false
+	}
+
+	fileInfo, err := os.Stat(absPath)
+	return !os.IsNotExist(err) && fileInfo.IsDir()
+}
+
+func FindGitRoot(strPath string) string {
+	if hasGitFolder(strPath) {
+		return strPath
+	}
+
+	parentPath := filepath.Dir(strPath)
+	if parentPath == strPath {
+		return ""
+	}
+
+	return FindGitRoot(parentPath)
+}
+
+func followGitRefs(root string, link string) string {
+	fileContent, err := os.ReadFile(filepath.Join(root, link))
+	if err != nil {
+		return ""
+	}
+	content := string(fileContent)
+	if strings.HasPrefix(content, "ref:") {
+		splitContent := strings.Split(content, " ")
+		if len(splitContent) > 1 {
+			nextLink := strings.TrimSpace(splitContent[1])
+			return followGitRefs(root, nextLink)
+		}
+	}
+
+	return strings.TrimSpace(content)
+}
+
+func fetchGitInfo(opts *config.KanikoOptions) (string, string) {
+	if opts.IgnoreGitMetadata {
+		return "", ""
+	}
+
+	gitRoot := FindGitRoot(opts.SrcContext)
+	if gitRoot == "" {
+		return "", ""
+	}
+
+	// Getting the revision
+	gitRevision := followGitRefs(filepath.Join(gitRoot, ".git"), "HEAD")
+	if gitRevision == "" {
+		return "", ""
+	}
+
+	// Getting the remote URL
+	fileContent, err := os.ReadFile(filepath.Join(gitRoot, ".git", "config"))
+	if err != nil {
+		return "", ""
+	}
+	content := string(fileContent)
+	r := regexp.MustCompile("\\[remote \"origin\"]\\s*url\\s*=\\s(?P<url>\\S*)")
+	matches := r.FindStringSubmatch(content)
+	urlIndex := r.SubexpIndex("url")
+	if urlIndex >= len(matches) {
+		return "", ""
+	}
+
+	gitRemoteURL := matches[urlIndex]
+	return gitRevision, gitRemoteURL
+}
+
 // DoBuild executes building the Dockerfile
 func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 	t := timing.Start("Total Build Time")
 	digestToCacheKey := make(map[string]string)
 	stageIdxToDigest := make(map[string]string)
+
+	// Get the git info
+	gitRevision, gitRemoteURL := fetchGitInfo(opts)
 
 	stages, metaArgs, err := dockerfile.ParseStages(opts)
 	if err != nil {
@@ -692,6 +770,22 @@ func DoBuild(opts *config.KanikoOptions) (v1.Image, error) {
 		logrus.Debugf("Mapping digest %v to cachekey %v", d.String(), sb.finalCacheKey)
 
 		if stage.Final {
+			configFile, err = sourceImage.ConfigFile()
+			if err != nil {
+				return nil, err
+			}
+			if gitRevision != "" && gitRemoteURL != "" {
+				if configFile.Config.Labels == nil {
+					configFile.Config.Labels = make(map[string]string)
+				}
+				configFile.Config.Labels[constants.GitSource] = gitRemoteURL
+				configFile.Config.Labels[constants.GitRevision] = gitRevision
+			}
+			sourceImage, err = mutate.ConfigFile(sourceImage, configFile)
+			if err != nil {
+				return nil, err
+			}
+
 			sourceImage, err = mutate.CreatedAt(sourceImage, v1.Time{Time: time.Now()})
 			if err != nil {
 				return nil, err

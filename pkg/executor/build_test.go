@@ -20,6 +20,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"fmt"
+	"github.com/GoogleContainerTools/kaniko/pkg/constants"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -1700,5 +1701,251 @@ func Test_ResolveCrossStageInstructions(t *testing.T) {
 
 		expectedMap := map[string]string{"second": "1", "third": "2"}
 		testutil.CheckDeepEqual(t, expectedMap, stageToIdx)
+	}
+}
+
+func setupGitTests(t *testing.T) (string, func()) {
+	// Create workspace with .git directory inside the base of the build context
+	// workspace tree:
+	//     /root
+	//         /kaniko
+	//         /workspace
+	//             /inner
+	//             /.git
+	//                 -HEAD
+	//                 -config
+	//                 /refs
+	//				       /heads
+	//				           -main
+	//				           -branch
+
+	testDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(testDir, "kaniko/0"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	workspace := filepath.Join(testDir, "workspace")
+	if err := os.MkdirAll(filepath.Join(workspace, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(workspace, "inner"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create HEAD file, but fill it up with different values in the tests themselves
+	head := filepath.Join(workspace, ".git", "HEAD")
+	if err := os.MkdirAll(head, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	sampleUrl := "git@github.com:example/Example.git"
+
+	configContent := fmt.Sprintf(`
+[remote "origin"]
+    url = %s
+    fetch = +refs/heads/*:refs/remotes/origin/*`, sampleUrl)
+	configFile := filepath.Join(workspace, ".git", "config")
+	if err := os.WriteFile(configFile, []byte(configContent), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	refs := filepath.Join(workspace, ".git", "refs", "heads")
+	if err := os.MkdirAll(refs, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	mainSha256 := "0d6e4079e36703ebd37c00722f5891d28b0e2811dc114b129215123adcce3605"
+	if err := os.WriteFile(filepath.Join(refs, "main"), []byte(mainSha256), 0755); err != nil {
+		t.Fatal(err)
+	}
+	branchSha256 := "f38c764c8aa00b6578f4254a4dc6d9b50f88fa926e270ea7859bd1b707cd8662"
+	if err := os.WriteFile(filepath.Join(refs, "branch"), []byte(branchSha256), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// set up config
+	config.RootDir = testDir
+	config.KanikoDir = fmt.Sprintf("%s/%s", testDir, "kaniko")
+	// Write path to ignore list
+	if err := os.MkdirAll(filepath.Join(testDir, "proc"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	mFile := filepath.Join(testDir, "proc/mountinfo")
+	mountInfo := fmt.Sprintf(
+		`36 35 98:0 /kaniko %s/kaniko rw,noatime master:1 - ext3 /dev/root rw,errors=continue
+36 35 98:0 /proc %s/proc rw,noatime master:1 - ext3 /dev/root rw,errors=continue
+`, testDir, testDir)
+	if err := ioutil.WriteFile(mFile, []byte(mountInfo), 0644); err != nil {
+		t.Fatal(err)
+	}
+	config.MountInfoPath = mFile
+
+	return testDir, func() {
+		config.RootDir = constants.RootDir
+		config.MountInfoPath = constants.MountInfoPath
+	}
+}
+
+func Test_GitAutoLabels(t *testing.T) {
+	testDir, fn := setupGitTests(t)
+	defer fn()
+	dockerFile := `
+FROM scratch
+ENV test test`
+	os.WriteFile(filepath.Join(testDir, "workspace", "Dockerfile"), []byte(dockerFile), 0755)
+	opts := &config.KanikoOptions{
+		DockerfilePath: filepath.Join(testDir, "workspace", "Dockerfile"),
+		SrcContext:     filepath.Join(testDir, "workspace"),
+	}
+
+	image, err := DoBuild(opts)
+	testutil.CheckNoError(t, err)
+
+	imageConfig, err := image.ConfigFile()
+	testutil.CheckNoError(t, err)
+
+	testutil.CheckDeepEqual(t, "git@github.com:example/Example.git", imageConfig.Config.Labels[constants.GitSource])
+	testutil.CheckDeepEqual(t, "0d6e4079e36703ebd37c00722f5891d28b0e2811dc114b129215123adcce3605", imageConfig.Config.Labels[constants.GitRevision])
+}
+
+func Test_GitAutoLabelsSubContext(t *testing.T) {
+	testDir, fn := setupGitTests(t)
+	defer fn()
+	dockerFile := `
+FROM scratch
+ENV test test`
+	os.WriteFile(filepath.Join(testDir, "workspace", "inner", "Dockerfile"), []byte(dockerFile), 0755)
+	opts := &config.KanikoOptions{
+		DockerfilePath: filepath.Join(testDir, "workspace", "Dockerfile"),
+		SrcContext:     filepath.Join(testDir, "workspace", "inner"),
+	}
+
+	image, err := DoBuild(opts)
+	testutil.CheckNoError(t, err)
+
+	imageConfig, err := image.ConfigFile()
+	testutil.CheckNoError(t, err)
+
+	testutil.CheckDeepEqual(t, "git@github.com:example/Example.git", imageConfig.Config.Labels[constants.GitSource])
+	testutil.CheckDeepEqual(t, "0d6e4079e36703ebd37c00722f5891d28b0e2811dc114b129215123adcce3605", imageConfig.Config.Labels[constants.GitRevision])
+}
+
+func Test_GitAutoLabelsMissingHead(t *testing.T) {
+	testDir, fn := setupGitTests(t)
+	defer fn()
+	dockerFile := `
+FROM scratch
+ENV test test`
+	os.WriteFile(filepath.Join(testDir, "workspace", "Dockerfile"), []byte(dockerFile), 0755)
+	opts := &config.KanikoOptions{
+		DockerfilePath: filepath.Join(testDir, "workspace", "Dockerfile"),
+		SrcContext:     filepath.Join(testDir, "workspace"),
+	}
+
+	os.Remove(filepath.Join(testDir, ".git", "HEAD"))
+
+	image, err := DoBuild(opts)
+	testutil.CheckNoError(t, err)
+
+	imageConfig, err := image.ConfigFile()
+	testutil.CheckNoError(t, err)
+
+	_, exists := imageConfig.Config.Labels[constants.GitSource]
+	if exists {
+		t.Errorf("Found label %s even though it shouldn't exist", constants.GitSource)
+	}
+	_, exists = imageConfig.Config.Labels[constants.GitRevision]
+	if exists {
+		t.Errorf("Found label %s even though it shouldn't exist", constants.GitRevision)
+	}
+}
+
+func Test_GitAutoLabelsMissingConfig(t *testing.T) {
+	testDir, fn := setupGitTests(t)
+	defer fn()
+	dockerFile := `
+FROM scratch
+ENV test test`
+	os.WriteFile(filepath.Join(testDir, "workspace", "Dockerfile"), []byte(dockerFile), 0755)
+	opts := &config.KanikoOptions{
+		DockerfilePath: filepath.Join(testDir, "workspace", "Dockerfile"),
+		SrcContext:     filepath.Join(testDir, "workspace"),
+	}
+
+	os.Remove(filepath.Join(testDir, ".git", "config"))
+
+	image, err := DoBuild(opts)
+	testutil.CheckNoError(t, err)
+
+	imageConfig, err := image.ConfigFile()
+	testutil.CheckNoError(t, err)
+
+	_, exists := imageConfig.Config.Labels[constants.GitSource]
+	if exists {
+		t.Errorf("Found label %s even though it shouldn't exist", constants.GitSource)
+	}
+	_, exists = imageConfig.Config.Labels[constants.GitRevision]
+	if exists {
+		t.Errorf("Found label %s even though it shouldn't exist", constants.GitRevision)
+	}
+}
+
+func Test_GitAutoLabelsNoGitDir(t *testing.T) {
+	testDir, fn := setupGitTests(t)
+	defer fn()
+	dockerFile := `
+FROM scratch
+ENV test test`
+	os.WriteFile(filepath.Join(testDir, "workspace", "Dockerfile"), []byte(dockerFile), 0755)
+	opts := &config.KanikoOptions{
+		DockerfilePath: filepath.Join(testDir, "workspace", "Dockerfile"),
+		SrcContext:     filepath.Join(testDir, "workspace"),
+	}
+
+	os.RemoveAll(filepath.Join(testDir, ".git"))
+
+	image, err := DoBuild(opts)
+	testutil.CheckNoError(t, err)
+
+	imageConfig, err := image.ConfigFile()
+	testutil.CheckNoError(t, err)
+
+	_, exists := imageConfig.Config.Labels[constants.GitSource]
+	if exists {
+		t.Errorf("Found label %s even though it shouldn't exist", constants.GitSource)
+	}
+	_, exists = imageConfig.Config.Labels[constants.GitRevision]
+	if exists {
+		t.Errorf("Found label %s even though it shouldn't exist", constants.GitRevision)
+	}
+}
+
+func Test_GitAutoLabelsDisabled(t *testing.T) {
+	testDir, fn := setupGitTests(t)
+	defer fn()
+	dockerFile := `
+FROM scratch
+ENV test test`
+	os.WriteFile(filepath.Join(testDir, "workspace", "Dockerfile"), []byte(dockerFile), 0755)
+	opts := &config.KanikoOptions{
+		DockerfilePath:    filepath.Join(testDir, "workspace", "Dockerfile"),
+		SrcContext:        filepath.Join(testDir, "workspace"),
+		IgnoreGitMetadata: true,
+	}
+
+	image, err := DoBuild(opts)
+	testutil.CheckNoError(t, err)
+
+	imageConfig, err := image.ConfigFile()
+	testutil.CheckNoError(t, err)
+
+	_, exists := imageConfig.Config.Labels[constants.GitSource]
+	if exists {
+		t.Errorf("Found label %s even though it shouldn't exist", constants.GitSource)
+	}
+	_, exists = imageConfig.Config.Labels[constants.GitRevision]
+	if exists {
+		t.Errorf("Found label %s even though it shouldn't exist", constants.GitRevision)
 	}
 }

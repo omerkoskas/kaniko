@@ -112,6 +112,7 @@ _If you are interested in contributing to kaniko, see
       - [Flag `--ignore-var-run`](#flag---ignore-var-run)
       - [Flag `--ignore-path`](#flag---ignore-path)
       - [Flag `--image-fs-extract-retry`](#flag---image-fs-extract-retry)
+      - [Flag `--ignore-git-metadata`](#flag---ignore-git-metadata)
     - [Debug Image](#debug-image)
   - [Security](#security)
     - [Verifying Signed Kaniko Images](#verifying-signed-kaniko-images)
@@ -1088,6 +1089,11 @@ Ignore /var/run when taking image snapshot. Set it to false to preserve
 
 Set this flag as `--ignore-path=<path>` to ignore path when taking an image
 snapshot. Set it multiple times for multiple ignore paths.
+
+#### Flag `--ignore-git-metadata`
+
+Set to true to have the final image not contain any git metadata of the build context version
+(e.g. repo URL and commit SHA256). Defaults to false.
 
 #### Flag `--image-fs-extract-retry`
 

@@ -58,6 +58,10 @@ const (
 	// S3 Custom endpoint ENV name
 	S3EndpointEnv    = "S3_ENDPOINT"
 	S3ForcePathStyle = "S3_FORCE_PATH_STYLE"
+
+	// Git revisions labels
+	GitSource   = "org.opencontainers.image.source"
+	GitRevision = "org.opencontainers.image.revision"
 )
 
 // ScratchEnvVars are the default environment variables needed for a scratch image.
